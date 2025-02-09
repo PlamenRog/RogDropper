@@ -11,3 +11,6 @@ Compile it with:
 ```make
 make install
 ```
+
+TODO:
+ - Fix small graphical bugs
