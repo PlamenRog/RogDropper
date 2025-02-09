@@ -1,108 +1,190 @@
-#include <wayland-client.h>
-#include <wayland-client-protocol.h>
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/extensions/Xcomposite.h>
+#include <X11/extensions/Xfixes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <string.h>
 
-struct global {
-    struct wl_display *display;
-    struct wl_registry *registry;
-    struct wl_compositor *compositor;
-    struct wl_surface *surface;
-    struct wl_shell *shell;
-    struct wl_seat *seat;
-    struct wl_pointer *pointer;
-};
+#define MAGNIFIER_SIZE 100
+#define ZOOM_FACTOR 2
+#define DOT_SIZE 4
+#define DOT_OPACITY 0.5 // 0 -> fully transparent, 1 -> fully visible
 
-static void cursor_position(wl_fixed_t x, wl_fixed_t y) {
-    printf("Cursor Position: (%d, %d)\n", wl_fixed_to_int(x), wl_fixed_to_int(y));
+unsigned long blend_colors(unsigned long color1, unsigned long color2, double opacity) {
+    int r1 = (color1 >> 16) & 0xFF;
+    int g1 = (color1 >> 8) & 0xFF;
+    int b1 = color1 & 0xFF;
+
+    int r2 = (color2 >> 16) & 0xFF;
+    int g2 = (color2 >> 8) & 0xFF;
+    int b2 = color2 & 0xFF;
+
+    int r = (int)(r1 * (1 - opacity) + r2 * opacity);
+    int g = (int)(g1 * (1 - opacity) + g2 * opacity);
+    int b = (int)(b1 * (1 - opacity) + b2 * opacity);
+
+    return (r << 16) | (g << 8) | b;
 }
 
-static void cursor_enter() {}
-
-static void cursor_leave() {}
-
-static void cursor_button() {}
-
-static void cursor_axis() {}
-
-static void cursor_frame() {}
-
-static void cursor_axis_source() {}
-
-static void cursor_axis_stop() {}
-
-static void cursor_axis_discrete() {}
-
-static void cursor_axis_value120() {}
-
-static void cursor_axis_relative_direction() {}
-
-static const struct wl_pointer_listener pointer_listener = {
-    cursor_enter,
-    cursor_leave,
-    cursor_position,
-    cursor_button,
-    cursor_axis,
-    cursor_frame,
-    cursor_axis_source,
-    cursor_axis_stop,
-    cursor_axis_discrete,
-    cursor_axis_value120,
-    cursor_axis_relative_direction
-};
-
-static void registry_handle_global(void *data, struct wl_registry *registry,
-                                   uint32_t name, const char *interface) {
-    struct global *global = data;
-
-    if (strcmp(interface, "wl_compositor") == 0) {
-        global->compositor = wl_registry_bind(registry, name, &wl_compositor_interface, 1);
-    } else if (strcmp(interface, "wl_shell") == 0) {
-        global->shell = wl_registry_bind(registry, name, &wl_shell_interface, 1);
-    } else if (strcmp(interface, "wl_seat") == 0) {
-        global->seat = wl_registry_bind(registry, name, &wl_seat_interface, 1);
+void scale_image(XImage *src, XImage *dest, int zoom_factor) {
+    for (int y = 0; y < dest->height; y++) {
+        for (int x = 0; x < dest->width; x++) {
+            int src_x = x / zoom_factor;
+            int src_y = y / zoom_factor;
+            XPutPixel(dest, x, y, XGetPixel(src, src_x, src_y));
+        }
     }
 }
-
-static void registry_handle_global_remove() {}
-
-static const struct wl_registry_listener registry_listener = {
-    registry_handle_global,
-    registry_handle_global_remove
-};
 
 int main() {
-    struct global global = {0};
+    Display *display;
+    Window root, magnifier;
+    XGCValues gc_values;
+    GC gc;
+    XEvent event;
+    XFixesCursorImage *cursor_image;
+    int screen;
+    unsigned long black, red;
+    int x, y;
+    XImage *src_image, *dest_image;
 
-    global.display = wl_display_connect(NULL);
-    if (!global.display) {
-        fprintf(stderr, "Failed to connect to Wayland display\n");
-        return -1;
+    display = XOpenDisplay(NULL);
+    if (display == NULL) {
+        fprintf(stderr, "Cannot open display\n");
+        exit(1);
     }
 
-    global.registry = wl_display_get_registry(global.display);
-    wl_registry_add_listener(global.registry, &registry_listener, &global);
-    wl_display_roundtrip(global.display); // Process events
+    screen = DefaultScreen(display);
+    root = RootWindow(display, screen);
+    black = BlackPixel(display, screen);
 
-    if (!global.compositor || !global.shell || !global.seat) {
-        fprintf(stderr, "Failed to get compositor, shell, or seat\n");
-        return -1;
+    XColor color;
+    if (!XParseColor(display, DefaultColormap(display, screen), "red", &color)) {
+        fprintf(stderr, "Failed to parse color 'red'\n");
+        exit(1);
+    }
+    red = color.pixel;
+
+    XSetWindowAttributes attrs;
+    attrs.override_redirect = True; // enable borderless
+    attrs.background_pixel = black;
+
+    magnifier = XCreateWindow(display, root, 0, 0, MAGNIFIER_SIZE, MAGNIFIER_SIZE, 0,
+                              CopyFromParent, InputOutput, CopyFromParent,
+                              CWOverrideRedirect | CWBackPixel, &attrs);
+
+    XSelectInput(display, magnifier, ExposureMask);
+    XMapWindow(display, magnifier);
+
+    gc = XCreateGC(display, magnifier, 0, &gc_values);
+
+    int event_base, error_base;
+    if (!XFixesQueryExtension(display, &event_base, &error_base)) {
+        fprintf(stderr, "XFixes extension not available\n");
+        exit(1);
+    }
+
+    dest_image = XCreateImage(display, DefaultVisual(display, screen), DefaultDepth(display, screen),
+                              ZPixmap, 0, NULL, MAGNIFIER_SIZE, MAGNIFIER_SIZE, 32, 0);
+    dest_image->data = malloc(dest_image->bytes_per_line * dest_image->height);
+
+    int screen_width = DisplayWidth(display, screen);
+    int screen_height = DisplayHeight(display, screen);
+
+    if (XGrabPointer(display, root, False, ButtonPressMask, GrabModeAsync, GrabModeAsync,
+                     None, None, CurrentTime) != GrabSuccess) {
+        fprintf(stderr, "Failed to grab the pointer.\n");
+        exit(1);
+    }
+
+    while (1) {
+        XFixesSelectCursorInput(display, root, XFixesDisplayCursorNotifyMask);
+        cursor_image = XFixesGetCursorImage(display);
+        x = cursor_image->x;
+        y = cursor_image->y;
+		
+		// make captured aria within screen bounds
+        int capture_x = x - MAGNIFIER_SIZE / (2 * ZOOM_FACTOR);
+        int capture_y = y - MAGNIFIER_SIZE / (2 * ZOOM_FACTOR);
+        int capture_width = MAGNIFIER_SIZE / ZOOM_FACTOR;
+        int capture_height = MAGNIFIER_SIZE / ZOOM_FACTOR;
+
+        if (capture_x < 0) capture_x = 0;
+        if (capture_y < 0) capture_y = 0;
+        if (capture_x + capture_width > screen_width) capture_x = screen_width - capture_width;
+        if (capture_y + capture_height > screen_height) capture_y = screen_height - capture_height;
+
+        src_image = XGetImage(display, root, capture_x, capture_y, capture_width, capture_height, AllPlanes, ZPixmap);
+
+        if (src_image && dest_image) {
+            scale_image(src_image, dest_image, ZOOM_FACTOR);
+
+			// draws the dot in the center
+            int center_x = MAGNIFIER_SIZE / 2;
+            int center_y = MAGNIFIER_SIZE / 2;
+            for (int dy = -DOT_SIZE / 2; dy <= DOT_SIZE / 2; dy++) {
+                for (int dx = -DOT_SIZE / 2; dx <= DOT_SIZE / 2; dx++) {
+                    int px = center_x + dx;
+                    int py = center_y + dy;
+                    if (px >= 0 && px < MAGNIFIER_SIZE && py >= 0 && py < MAGNIFIER_SIZE) {
+                        unsigned long pixel = XGetPixel(dest_image, px, py);
+                        unsigned long blended_pixel = blend_colors(pixel, red, DOT_OPACITY);
+                        XPutPixel(dest_image, px, py, blended_pixel);
+                    }
+                }
+            }
+
+            XPutImage(display, magnifier, gc, dest_image, 0, 0, 0, 0, MAGNIFIER_SIZE, MAGNIFIER_SIZE);
+            XDestroyImage(src_image);
+        }
+
+        XMoveWindow(display, magnifier, x + 20, y + 20);
+
+        while (XPending(display)) {
+            XNextEvent(display, &event);
+
+            if (event.type == Expose) {
+                if (src_image && dest_image) {
+                    XPutImage(display, magnifier, gc, dest_image, 0, 0, 0, 0, MAGNIFIER_SIZE, MAGNIFIER_SIZE);
+                }
+            } else if (event.type == ButtonPress) {
+                if (event.xbutton.button == Button1) {
+                    printf("Left mouse button clicked! Printing color at cursor...\n");
+
+                    int center_x = x;
+                    int center_y = y;
+
+                    if (center_x >= 0 && center_x < screen_width && center_y >= 0 && center_y < screen_height) {
+                        XImage *pixel_image = XGetImage(display, root, center_x, center_y, 1, 1, AllPlanes, ZPixmap);
+                        if (pixel_image) {
+                            unsigned long pixel = XGetPixel(pixel_image, 0, 0);
+                            int r = (pixel >> 16) & 0xFF;
+                            int g = (pixel >> 8) & 0xFF;
+                            int b = pixel & 0xFF;
+							printf("#%02X%02X%02X\n", r, g, b);
+                            XDestroyImage(pixel_image);
+							
+							XUngrabPointer(display, CurrentTime); // just to be safe
+
+						    XDestroyImage(dest_image);
+						    XFreeGC(display, gc);
+						    XDestroyWindow(display, magnifier);
+						    XCloseDisplay(display);
+							return 0;
+                        }
+                    } else {
+                        fprintf(stderr, "Cursor is outside screen bounds\n");
+                    }
+                }
+            }
+        }
+
+        XFree(cursor_image);
+
+        usleep(10000);
     }
 
 
-    global.surface = wl_compositor_create_surface(global.compositor);
-
-
-    global.pointer = wl_seat_get_pointer(global.seat);
-    wl_pointer_add_listener(global.pointer, &pointer_listener, &global);
-
-
-    while (wl_display_dispatch(global.display) != -1) {
-		// TODO: implement the rest of the solution
-    }
-
-    wl_display_disconnect(global.display);
     return 0;
 }
