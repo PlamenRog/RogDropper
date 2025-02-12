@@ -11,10 +11,8 @@ Compile it with:
 ```make
 make install
 ```
-<pre>
 
 
-</pre>
 Recommended way to run is through some script like:
 ```bash
 rogdrop | xclip
