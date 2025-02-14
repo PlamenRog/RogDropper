@@ -76,8 +76,8 @@ int main()
 	attrs.background_pixel = black;
 
 	magnifier = XCreateWindow(display, root, 0, 0, MAGNIFIER_SIZE, MAGNIFIER_SIZE, 0,
-							  CopyFromParent, InputOutput, CopyFromParent,
-							  CWOverrideRedirect | CWBackPixel, &attrs);
+	                          CopyFromParent, InputOutput, CopyFromParent,
+	                          CWOverrideRedirect | CWBackPixel, &attrs);
 
 	XSelectInput(display, magnifier, ExposureMask);
 	XMapWindow(display, magnifier);
@@ -92,7 +92,7 @@ int main()
 	}
 
 	dest_image = XCreateImage(display, DefaultVisual(display, screen), DefaultDepth(display, screen),
-							  ZPixmap, 0, NULL, MAGNIFIER_SIZE, MAGNIFIER_SIZE, 32, 0);
+	                          ZPixmap, 0, NULL, MAGNIFIER_SIZE, MAGNIFIER_SIZE, 32, 0);
 	dest_image->data = malloc(dest_image->bytes_per_line * dest_image->height);
 
 	int screen_width = DisplayWidth(display, screen);
@@ -200,7 +200,6 @@ int main()
 		}
 
 		XFree(cursor_image);
-
 		usleep(10000);
 	}
 
